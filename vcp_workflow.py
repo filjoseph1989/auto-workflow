@@ -13,6 +13,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import google.auth
+import google.auth.exceptions
 import gspread
 
 CONFIG_PATH = Path(os.environ.get("VCP_WORKFLOW_CONFIG", Path.home() / ".config/vcp/workflow.json"))
@@ -30,7 +32,6 @@ PHASES = [
     "Testing & Quality Assurance",
     "Deployment & Documentation",
 ]
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SPRINT_JQL = "assignee=currentUser() and sprint in openSprints()"
 FALLBACK_JQL = "assignee=currentUser()"
 
@@ -115,10 +116,55 @@ def load_config():
         fail(f"invalid JSON in {CONFIG_PATH}: {e}")
     if not config.get("spreadsheet_id"):
         fail(f"spreadsheet_id is missing in {CONFIG_PATH}")
-    return config["spreadsheet_id"], config.get("tab", "Weekly List"), int(config.get("section", 7))
+    # Where Claude looks for code: env, then config, then the current directory
+    root = os.environ.get("VCP_PROJECT_ROOT") or config.get("project_root") or os.getcwd()
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        fail(f"project_root {root} is not a directory (set it in {CONFIG_PATH} or VCP_PROJECT_ROOT)")
+    return (config["spreadsheet_id"], config.get("tab", "Weekly List"),
+            int(config.get("section", 7)), root)
 
 
-SPREADSHEET_ID, TAB, SECTION = load_config()
+SPREADSHEET_ID, TAB, SECTION, PROJECT_ROOT = load_config()
+HAS_GUM = shutil.which("gum") is not None
+
+
+def require(*tools):
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing:
+        fail(f"not found in PATH: {', '.join(missing)} (see Setup in the README)")
+
+
+def choose(options, header, multi=False):
+    """Pick from options with gum if installed, otherwise with a numbered prompt."""
+    if HAS_GUM:
+        cmd = ["gum", "choose", "--header", header]
+        if multi:
+            cmd += ["--no-limit", "--show-help", "--unselected-prefix", "[ ] ",
+                    "--selected-prefix", "[✓] ", "--cursor-prefix", "[ ] "]
+        out = subprocess.run(cmd, input="\n".join(options), stdout=subprocess.PIPE, text=True)
+        if out.returncode and multi:
+            sys.exit(out.returncode)
+        return [line for line in out.stdout.splitlines() if line.strip()]
+    print(header)
+    for n, option in enumerate(options, 1):
+        print(f"  {n}) {option}")
+    hint = "numbers separated by spaces, or 'all'" if multi else "a number"
+    while True:
+        try:
+            answer = input(f"Choose ({hint}): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(130)
+        if multi and answer == "all":
+            return list(options)
+        try:
+            picked = [options[int(x) - 1] for x in answer.replace(",", " ").split()]
+        except (ValueError, IndexError):
+            picked = []
+        if picked and (multi or len(picked) == 1):
+            return picked
+        print("Invalid choice, try again.")
 
 
 def jira_list(jql):
@@ -152,15 +198,8 @@ def pick(issues):
 
     width = max(len(i["status"]) for i in issues)
     lines = [f'{i["key"]}  {i["status"]:<{width}}  {i["summary"]}' for i in issues]
-    out = subprocess.run(
-        ["gum", "choose", "--no-limit", "--show-help",
-        "--unselected-prefix", "[ ] ", "--selected-prefix", "[✓] ", "--cursor-prefix", "[ ] ",
-        "--header", "Pick tickets (x to check, enter to confirm)"],
-        input="\n".join(lines), stdout=subprocess.PIPE, text=True,
-    )
-    if out.returncode:
-        sys.exit(out.returncode)
-    keys = [line.split()[0] for line in out.stdout.splitlines() if line.strip()]
+    header = "Pick tickets (x to check, enter to confirm)" if HAS_GUM else "Pick tickets"
+    keys = [line.split()[0] for line in choose(lines, header, multi=True)]
     if not keys:
         fail("no tickets selected; check one with x (or ctrl+a for all) before pressing enter")
     print(f"Selected: {', '.join(keys)}")
@@ -235,10 +274,7 @@ def review(entry):
     while True:
         print(f'\n{entry["key"]} {entry["title"]}')
         print_rows(build_rows(entry, "N")[1:])
-        choice = subprocess.run(
-            ["gum", "choose", "Write", "Edit", "Skip", "--header", f'{entry["key"]}:'],
-            stdout=subprocess.PIPE, text=True,
-        ).stdout.strip()
+        choice = (choose(["Write", "Edit", "Skip"], f'{entry["key"]}:') or ["Skip"])[0]
         if choice == "Write":
             return entry
         if choice != "Edit":
@@ -259,9 +295,17 @@ def review(entry):
         os.unlink(f.name)
 
 
+LOGIN_CMD = """gcloud auth application-default login \\
+    --client-id-file="$HOME/.config/vcp/client_secret.json" \\
+    --scopes=https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/cloud-platform"""
+
+
 def open_sheet():
-    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+    try:
+        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+    except google.auth.exceptions.GoogleAuthError as e:
+        fail(f"Google login is missing or expired ({e}).\nLog in again with:\n  {LOGIN_CMD}")
 
 
 def sheet_state(ws):
@@ -338,6 +382,7 @@ def main():
         new_week(args.dry_run)
         return
 
+    require("jira", "claude")
     if args.keys:
         keys = [k.upper() for k in args.keys]
         issues = jira_list(f"key in ({', '.join(keys)})")
@@ -349,8 +394,6 @@ def main():
         issues = pick(fetch_issues())
     if not issues:
         return
-
-    print("debug: came in this line")
 
     sh = open_sheet()
     ws = sh.worksheet(TAB)

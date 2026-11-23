@@ -1,4 +1,33 @@
 #!/bin/sh
-# Runs vcp_workflow.py with its venv. Symlink into PATH: ln -s "$PWD/vcp-workflow" ~/.local/bin/
-dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-exec "$dir/.venv/bin/python" "$dir/vcp_workflow.py" "$@"
+# Runs vcp_workflow.py with its own venv, creating or updating it when needed.
+# Symlink into PATH: ln -s "$PWD/vcp-workflow" ~/.local/bin/
+set -e
+
+# Resolve symlinks without readlink -f (not available everywhere)
+src="$0"
+while [ -L "$src" ]; do
+  link="$(readlink "$src")"
+  case "$link" in
+    /*) src="$link" ;;
+    *) src="$(dirname "$src")/$link" ;;
+  esac
+done
+dir="$(cd "$(dirname "$src")" && pwd)"
+
+venv="$dir/.venv"
+py="$venv/bin/python"
+stamp="$venv/.requirements.txt"
+
+if ! "$py" -c '' 2>/dev/null || ! cmp -s "$dir/requirements.txt" "$stamp"; then
+  base="${VCP_PYTHON:-$(command -v python3 || command -v python || true)}"
+  if [ -z "$base" ]; then
+    echo "error: Python 3.9+ not found; install it or set VCP_PYTHON" >&2
+    exit 1
+  fi
+  echo "Setting up $venv..." >&2
+  "$py" -c '' 2>/dev/null || "$base" -m venv --clear "$venv"
+  "$py" -m pip install --quiet --disable-pip-version-check -r "$dir/requirements.txt" >&2
+  cp "$dir/requirements.txt" "$stamp"
+fi
+
+exec "$py" "$dir/vcp_workflow.py" "$@"

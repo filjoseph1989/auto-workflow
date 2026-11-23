@@ -43,11 +43,14 @@ We keep the script because it runs every week and the sheet has to be exact. If 
 
 ## Setup (done once)
 
-- `.venv` with `gspread` + `google-auth` (Python 3.13); `gum` via Homebrew; `vcp-workflow` symlinked into `~/.local/bin`.
-- `~/.config/vcp/workflow.json` says which sheet to write to (set `VCP_WORKFLOW_CONFIG` to use another path):
+- `vcp-workflow` symlinked into `~/.local/bin`. On first run it creates `.venv` and installs `requirements.txt` with any Python 3.9+ (set `VCP_PYTHON` to choose one), and reinstalls when `requirements.txt` changes.
+- `gum` is optional: without it, the picker and review step use numbered prompts.
+- `~/.config/vcp/workflow.json` says which sheet to write to and where your code is (set `VCP_WORKFLOW_CONFIG` to use another path):
   ```json
-  {"spreadsheet_id": "<id from the sheet URL>", "tab": "Weekly List", "section": 7}
+  {"spreadsheet_id": "<id from the sheet URL>", "tab": "Weekly List", "section": 7,
+   "project_root": "~/code/vcp"}
   ```
+  `project_root` is the folder that contains `value-chain-v2`, `value-chain-api-v2` and so on; Claude reads code there. If it's not set (and `VCP_PROJECT_ROOT` isn't either), the current directory is used.
 - Google auth uses Application Default Credentials with your own OAuth client, because gcloud's built-in client is blocked for the Sheets scope. If the token expires or is revoked:
   ```sh
   gcloud auth application-default login \
@@ -59,13 +62,13 @@ We keep the script because it runs every week and the sheet has to be exact. If 
 
 Everything is per person: their own Jira login, Google login, sheet and config. Nothing they do touches yours.
 
-1. **Tools:** `brew install gum jira-cli python@3.13`, plus `gcloud` and the `claude` CLI. Run `jira init` to log in to Jira.
-2. **Copy this folder** (without `.venv`), then in it:
+1. **Tools:** Python 3.9+, `jira-cli`, `gcloud` and the `claude` CLI (`gum` optional). On macOS: `brew install jira-cli python gum`. Run `jira init` to log in to Jira.
+2. **Copy or clone this folder** (without `.venv`), then in it:
    ```sh
-   python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
    ln -s "$PWD/vcp-workflow" ~/.local/bin/
    ```
-3. **Their sheet:** make a copy of the workflow sheet with a `Weekly List` tab, and put its ID in `~/.config/vcp/workflow.json` (see above).
+   The venv is created on first run.
+3. **Their sheet:** make a copy of the workflow sheet with a `Weekly List` tab, and put its ID and their `project_root` in `~/.config/vcp/workflow.json` (see above).
 4. **Google auth:** send them `client_secret.json` privately (not in a repo or channel), save it to `~/.config/vcp/client_secret.json`, and run the `gcloud auth application-default login` command above. They log in with their own Google account, which must be able to edit their sheet.
    - If the OAuth consent screen in Google Cloud Console is **External / Testing**, add their email as a test user first, or the login is blocked. If it's **Internal**, anyone in the Workspace can log in.
 5. Check it with `vcp-workflow --dry-run`.
